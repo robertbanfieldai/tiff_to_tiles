@@ -11,11 +11,13 @@ from pyproj import Transformer
 class TileGenerator:
     """Generate XYZ tiles from an input raster, preserving an existing alpha band.
 
-    The class performs percentile‑based (or manual) scaling of the three RGB bands
-    to 8‑bit and forwards an existing alpha band so that transparency is driven
-    by the alpha channel instead of a band‑level NODATA value. Pixels that fall
-    outside the chosen scaling range are clamped to 0/255 (very dark / bright)
-    and *remain visible* because the bands themselves carry no NODATA flag.
+    *   RGB bands are stretched to 8‑bit using either explicit limits or
+        per‑band percentiles.
+    *   An existing alpha band is forwarded so transparency is controlled by
+        the alpha channel, not by a band‑level NODATA flag.
+    *   The maximum zoom level is selected so that the nominal Web‑Mercator
+        pixel size is **never smaller** than the native ground‑sample distance
+        (i.e. no oversampling).
     """
 
     def __init__(
@@ -45,7 +47,6 @@ class TileGenerator:
 
     # ------------------------------------------------------------------ helpers
     def _check_required_tools(self) -> str:
-        """Ensure GDAL utilities are reachable and return the gdal2tiles command."""
         required = ["gdal_translate", "gdal2tiles", "gdal2tiles.py"]
         found: list[str] = []
         for tool in required:
@@ -61,9 +62,7 @@ class TileGenerator:
 
     @staticmethod
     def _find_rgb_bands(src: rasterio.io.DatasetReader) -> tuple[int, int, int]:
-        """Detect Red/Green/Blue band indices via color interpretation or description."""
         band_map: dict[str, int] = {}
-        # first pass – colour interpretation
         for idx, ci in enumerate(src.colorinterp, start=1):
             if ci.name.lower() == "red":
                 band_map["Red"] = idx
@@ -71,7 +70,6 @@ class TileGenerator:
                 band_map["Green"] = idx
             elif ci.name.lower() == "blue":
                 band_map["Blue"] = idx
-        # second pass – exact description match
         for idx, desc in enumerate(src.descriptions, start=1):
             if desc:
                 d = desc.lower()
@@ -81,7 +79,6 @@ class TileGenerator:
                     band_map["Green"] = idx
                 elif d == "blue" and "Blue" not in band_map:
                     band_map["Blue"] = idx
-        # third pass – fuzzy description contains("red"/"green"/"blue")
         for idx, desc in enumerate(src.descriptions, start=1):
             if desc:
                 d = desc.lower()
@@ -105,7 +102,6 @@ class TileGenerator:
     def _compute_percentiles(
         self, data: np.ndarray, nodata: float | int | None
     ) -> tuple[float, float, float, float]:
-        """Return p_low, p_high, min_val, max_val for a data block."""
         if nodata is None:
             valid = data
         else:
@@ -118,27 +114,34 @@ class TileGenerator:
         p_high = float(np.percentile(valid, self.percentile_range[1]))
         return p_low, p_high, min_val, max_val
 
+    # ------------------------- zoom logic (fixed to avoid oversampling)
     @staticmethod
     def _compute_max_zoom(native_res_mpp: float, latitude_deg: float) -> int:
+        """Return the **largest** zoom for which Web‑Mercator pixel size is **not smaller** than *native_res_mpp*.
+
+        The function walks upward in zoom; as soon as the Web‑Mercator pixel
+        size would drop *below* the dataset resolution (oversampling), it steps
+        back one level.
+        """
         lat = min(abs(latitude_deg), 85.0511)
+        prev_z = 0
         for z in range(30):
-            res_merc = (156543.03392 * math.cos(math.radians(lat))) / (2**z)
-            if res_merc <= native_res_mpp:
-                return z
+            res_merc = (156543.03392 * math.cos(math.radians(lat))) / (2 ** z)
+            if res_merc < native_res_mpp:  # would oversample at this level
+                return max(prev_z, 0)
+            prev_z = z
         return 30
 
     # ------------------------------------------------------------------- main run
     def run(self) -> None:
-        """Create scaled RGB(A) VRT and build XYZ tiles under *output_dir*."""
         with rasterio.open(self.input_file) as src:
-            nodata = src.nodata  # may be None – we now ignore it in output
+            nodata = src.nodata
             if self.red and self.green and self.blue:
                 bands = [(self.red, "Red"), (self.green, "Green"), (self.blue, "Blue")]
             else:
                 r, g, b = self._find_rgb_bands(src)
                 bands = [(r, "Red"), (g, "Green"), (b, "Blue")]
 
-            # build per‑band scaling
             if self.scale:
                 if self.verbose:
                     print("Using manually provided scale values:")
@@ -167,7 +170,6 @@ class TileGenerator:
                                 f"Band {band_num}: min = {min_val:.4f}, max = {max_val:.4f}, {pl}th = {p_min:.4f}, {ph}th = {p_max:.4f}"
                             )
 
-            # compute appropriate max zoom to avoid oversampling
             transform = src.transform
             native_res_mpp = max(abs(transform[0]), abs(transform[4]))
             bounds = src.bounds
@@ -177,12 +179,11 @@ class TileGenerator:
             effective_lat = max(abs(lat_top), abs(lat_bottom), 0)
             max_zoom = self._compute_max_zoom(native_res_mpp, effective_lat)
             if self.verbose:
-                print("Determined max zoom level to avoid oversampling:")
-                print(f"  Native resolution: {native_res_mpp:.6f} meters/pixel")
-                print(f"  Effective latitude: {effective_lat:.6f} degrees")
-                print(f"  Using maximum zoom level: {max_zoom}")
+                print("Determined max zoom level (no oversampling):")
+                print(f"  Native resolution : {native_res_mpp:.6f} m/px")
+                print(f"  Effective latitude: {effective_lat:.6f} °")
+                print(f"  Max zoom level    : {max_zoom}")
 
-            # look for an existing alpha band
             alpha_band = self._find_alpha_band(src)
             if alpha_band is None:
                 raise RuntimeError("Input raster does not contain an alpha band to forward.")
@@ -195,32 +196,33 @@ class TileGenerator:
             "-of",
             "VRT",
             "-a_nodata",
-            "none",  # remove NODATA so clamped pixels stay visible
+            "none",
         ]
 
-        # scaling arguments
         for i, (p_min, p_max) in enumerate(scales, start=1):
             cmd_translate += [f"-scale_{i}", str(p_min), str(p_max), "0", "255"]
 
-        # band selection – RGB followed by Alpha
         for band_num, _ in bands:
             cmd_translate += ["-b", str(band_num)]
         cmd_translate += ["-b", str(alpha_band)]
 
-        # input and output
         cmd_translate += [self.input_file, self.vrt_path]
 
         if self.verbose:
-            print("Creating scaled RGBA VRT (alpha preserved)...")
+            print("Creating scaled RGBA VRT…")
         subprocess.run(cmd_translate, check=True)
 
-        # -------------------------------------------------------------- gdal2tiles
-        cmd_tiles = [self.gdal2tiles_cmd, "-z", f"0-{max_zoom}", self.vrt_path, self.output_dir]
+        cmd_tiles = [
+            self.gdal2tiles_cmd,
+            "-z",
+            f"0-{max_zoom}",
+            self.vrt_path,
+            self.output_dir,
+        ]
         if self.verbose:
             print("Running gdal2tiles – generating XYZ tiles…")
         subprocess.run(cmd_tiles, check=True)
 
-        # cleanup + info
         os.remove(self.vrt_path)
         if self.verbose:
             print(f"Done. All output saved in: {self.output_dir}")
