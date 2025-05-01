@@ -21,7 +21,7 @@ sudo dnf install python python-pip gdal gdal-python-tools
 Then clone and install the package:
 
 ```bash
-git clone https://github.com/yourname/tiff_to_tiles.git
+git clone https://github.com/robertbanfieldai/tiff_to_tiles.git
 cd tiff_to_tiles
 pip install -e .
 ```
