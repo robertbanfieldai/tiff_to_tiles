@@ -8,12 +8,15 @@ import shutil
 from pyproj import Transformer
 
 class TileGenerator:
-    def __init__(self, input_file, red=None, green=None, blue=None, scale=None):
+    def __init__(self, input_file, red=None, green=None, blue=None, scale=None, verbose=True, use_minmax=False, percentile_range=(2.5, 97.5)):
         self.input_file = input_file
         self.red = red
         self.green = green
         self.blue = blue
         self.scale = scale
+        self.verbose = verbose
+        self.use_minmax = use_minmax
+        self.percentile_range = percentile_range
         self.output_dir = f"tiles_output_{uuid.uuid4().hex[:8]}"
         os.makedirs(self.output_dir, exist_ok=True)
         self.vrt_path = os.path.join(self.output_dir, "scaled_rgb.vrt")
@@ -72,7 +75,15 @@ class TileGenerator:
 
     def compute_percentiles(self, data, nodata):
         valid = data[data != nodata]
-        return np.percentile(valid, 2.5), np.percentile(valid, 97.5)
+        min_val = valid.min()
+        max_val = valid.max()
+
+        if self.use_minmax:
+            return min_val, max_val, min_val, max_val
+
+        p_low = np.percentile(valid, self.percentile_range[0])
+        p_high = np.percentile(valid, self.percentile_range[1])
+        return p_low, p_high, min_val, max_val
 
     def compute_max_zoom(self, native_res_mpp, latitude_deg):
         latitude_deg = min(abs(latitude_deg), 85.0511)
@@ -93,6 +104,11 @@ class TileGenerator:
                 bands = [(r_band, "Red"), (g_band, "Green"), (b_band, "Blue")]
 
             if self.scale:
+                if self.verbose:
+                    print("Using manually provided scale values:")
+                    print(f"  Red:   {self.scale[0]}–{self.scale[1]}")
+                    print(f"  Green: {self.scale[2]}–{self.scale[3]}")
+                    print(f"  Blue:  {self.scale[4]}–{self.scale[5]}")
                 scales = [
                     (self.scale[0], self.scale[1]),
                     (self.scale[2], self.scale[3]),
@@ -102,8 +118,13 @@ class TileGenerator:
                 scales = []
                 for band_num, _ in bands:
                     data = src.read(band_num)
-                    p2, p98 = self.compute_percentiles(data, nodata)
-                    scales.append((p2, p98))
+                    p_min, p_max, min_val, max_val = self.compute_percentiles(data, nodata)
+                    scales.append((p_min, p_max))
+                    if self.verbose:
+                        if self.use_minmax:
+                            print(f"Band {band_num}: using full min/max range: {min_val:.4f} to {max_val:.4f}")
+                        else:
+                            print(f"Band {band_num}: min = {min_val:.4f}, max = {max_val:.4f}, {self.percentile_range[0]}th = {p_min:.4f}, {self.percentile_range[1]}th = {p_max:.4f}")
 
             transform = src.transform
             native_res_mpp = max(abs(transform[0]), abs(transform[4]))
@@ -113,20 +134,28 @@ class TileGenerator:
             _, lat_bottom = transformer.transform((bounds.left + bounds.right) / 2, bounds.bottom)
             effective_lat = max(abs(lat_top), abs(lat_bottom), 0)
             max_zoom = self.compute_max_zoom(native_res_mpp, effective_lat)
+            if self.verbose:
+                print("Determined max zoom level to avoid oversampling:")
+                print(f"  Native resolution: {native_res_mpp:.6f} meters/pixel")
+                print(f"  Effective latitude: {effective_lat:.6f} degrees")
+                print(f"  Using maximum zoom level: {max_zoom}")
 
         cmd_translate = ["gdal_translate", "-ot", "Byte", "-of", "VRT"]
-        for i, (p2, p98) in enumerate(scales, start=1):
-            cmd_translate += [f"-scale_{i}", str(p2), str(p98), "0", "255"]
+        for i, (p_min, p_max) in enumerate(scales, start=1):
+            cmd_translate += [f"-scale_{i}", str(p_min), str(p_max), "0", "255"]
         for band_num, _ in bands:
             cmd_translate += ["-b", str(band_num)]
         cmd_translate += [self.input_file, self.vrt_path]
 
-        print("Creating scaled RGB VRT...")
+        if self.verbose:
+            print("Creating scaled RGB VRT...")
         subprocess.run(cmd_translate, check=True)
 
         cmd_tiles = [self.gdal2tiles_cmd, "-z", f"0-{max_zoom}", self.vrt_path, self.output_dir]
-        print("Running gdal2tiles...")
+        if self.verbose:
+            print("Running gdal2tiles...")
         subprocess.run(cmd_tiles, check=True)
 
         os.remove(self.vrt_path)
-        print(f"Done. All output saved in: {self.output_dir}")
+        if self.verbose:
+            print(f"Done. All output saved in: {self.output_dir}")
