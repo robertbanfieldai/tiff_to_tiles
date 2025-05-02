@@ -214,8 +214,12 @@ class TileGenerator:
 
         cmd_tiles = [
             self.gdal2tiles_cmd,
-            "-z",
-            f"0-{max_zoom}",
+            "--tilesize", "1024",
+            "--tiledriver", "WEBP",
+            "--webp-lossless",
+            "--processes", str(os.cpu_count()),
+            "-z", f"0-{max_zoom}",
+            "-x",
             self.vrt_path,
             self.output_dir,
         ]
